@@ -5,303 +5,244 @@ from PIL import Image
 import pytesseract
 import easyocr
 import re
-import io
 import logging
+from typing import List, Tuple, Dict
 
-# Initialize once (EasyOCR downloads models on first run; this might take a moment)
-easyocr_reader = easyocr.Reader(['en'], gpu=False)  # set gpu=True if you have GPU and want faster results
+# -------------------- Config --------------------
+TESS_CONF_THRESHOLD = 50
+ALPHA_RATIO_THRESHOLD = 0.35
+MAX_GIBBERISH_TOKEN_RATIO = 0.6
+
+# initialize EasyOCR (downloads models on first run)
+easyocr_reader = easyocr.Reader(['en'], gpu=False)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-# -------------------- Preprocessing helpers --------------------
-def load_image_cv(image_path):
-    """Load image as BGR (OpenCV)."""
-    img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+# -------------------- Helpers --------------------
+def _is_likely_gibberish(line: str) -> bool:
+    if not line or not line.strip():
+        return True
+    s = line.strip()
+    letters = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ]", "", s)
+    alpha_ratio = len(letters) / max(1, len(s))
+    tokens = [t for t in re.split(r"\s+", s) if t]
+    if len(tokens) == 0:
+        return True
+    gibberish_tokens = 0
+    for t in tokens:
+        alphacount = len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]", t))
+        if alphacount < 2:
+            gibberish_tokens += 1
+    token_gib_ratio = gibberish_tokens / len(tokens)
+    if alpha_ratio < ALPHA_RATIO_THRESHOLD and token_gib_ratio > MAX_GIBBERISH_TOKEN_RATIO:
+        return True
+    if all(len(t) == 1 for t in tokens) and len(tokens) > 4:
+        return True
+    return False
+
+
+def _clean_line(line: str) -> str:
+    if not line:
+        return ""
+    line = line.replace("\x0c", " ").replace("\u200b", "")
+    line = re.sub(r"\s+", " ", line).strip()
+    return line
+
+
+# -------------------- Image loading & preprocessing --------------------
+def _load_image_bgr(path: str) -> np.ndarray:
+    img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
-        # fallback to PIL if cv2 can't read path with unicode etc.
-        pil = Image.open(image_path).convert('RGB')
+        pil = Image.open(path).convert("RGB")
         img = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
     return img
 
 
-def deskew(image):
-    """Attempt to deskew the image using largest text contour orientation."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # binarize for moment calculation
-    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    coords = np.column_stack(np.where(bw < 255))
-    if coords.shape[0] < 10:
-        return image  # nothing to deskew
-    rect = cv2.minAreaRect(coords)
-    angle = rect[-1]
-    if angle < -45:
-        angle = -(90 + angle)
-    else:
-        angle = -angle
-
-    (h, w) = image.shape[:2]
-    center = (w // 2, h // 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    logger.info(f"Deskew angle: {angle:.2f}")
-    return rotated
-
-
-def increase_contrast_and_sharpen(gray):
-    """CLAHE + unsharp mask to improve contrast and stroke visibility."""
+def _preprocess_for_tesseract(img_bgr: np.ndarray) -> Image.Image:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     cl = clahe.apply(gray)
-    # Unsharp mask
-    blur = cv2.GaussianBlur(cl, (3, 3), 0)
-    sharp = cv2.addWeighted(cl, 1.5, blur, -0.5, 0)
-    return sharp
+    den = cv2.fastNlMeansDenoising(cl, None, h=10, templateWindowSize=7, searchWindowSize=21)
+    blur = cv2.GaussianBlur(den, (3, 3), 0)
+    sharp = cv2.addWeighted(den, 1.4, blur, -0.4, 0)
+    th = cv2.adaptiveThreshold(sharp, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 11, 2)
+    pil = Image.fromarray(cv2.cvtColor(th, cv2.COLOR_GRAY2RGB))
+    return pil
 
 
-def thicken_strokes(binary):
-    """Use morphological operations to thicken faint pen strokes."""
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    dilated = cv2.dilate(binary, kernel, iterations=1)
-    return dilated
+def _preprocess_for_handwriting(img_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    den = cv2.fastNlMeansDenoising(gray, None, h=7, templateWindowSize=7, searchWindowSize=21)
+    den = cv2.normalize(den, None, 0, 255, cv2.NORM_MINMAX)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    den = clahe.apply(den)
+    return den
 
 
-def preprocess_image(image_path):
-    """
-    Full preprocessing pipeline returning both a "tesseract-friendly" PIL image
-    and a "easyocr-friendly" OpenCV image (both grayscale/binary).
-    """
-    img = load_image_cv(image_path)
-    img = deskew(img)
-
-    # Convert to gray
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # Blur to remove small noise
-    gray = cv2.medianBlur(gray, 3)
-
-    # Increase contrast + sharpen
-    gray = increase_contrast_and_sharpen(gray)
-
-    # Binarize using Otsu
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Invert if background is dark
-    # count white vs black
-    if np.sum(binary == 255) < np.sum(binary == 0):
-        binary = cv2.bitwise_not(binary)
-
-    # Thicken strokes for faint pen
-    binary = thicken_strokes(binary)
-
-    # Return:
-    # - PIL image for pytesseract (RGB)
-    # - OpenCV grayscale/binary for EasyOCR
-    pil_for_tesseract = Image.fromarray(cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB))
-    easyocr_img = binary.copy()
-
-    return pil_for_tesseract, easyocr_img
-
-
-# -------------------- OCR extraction helpers --------------------
-def run_tesseract(pil_image, config=None):
-    """
-    Return text and optional per-line confidences (if available).
-    pil_image: PIL Image object
-    config: extra config string for tesseract (e.g. "--psm 6 --oem 3")
-    """
-    if config is None:
-        config = "--oem 3 --psm 6"  # good default: assume a single uniform block
-    try:
-        # Use image_to_string for plain text
-        text = pytesseract.image_to_string(pil_image, config=config)
-        # Also get data table to potentially inspect confidences
-        data = pytesseract.image_to_data(pil_image, output_type=pytesseract.Output.DICT, config=config)
-    except Exception as e:
-        logger.exception("Tesseract failed")
-        return "", None
-
-    # Build simple line list with average confidences
-    lines = []
+# -------------------- OCR Runners --------------------
+def _run_tesseract_on_pil(pil_img: Image.Image, config: str = "--oem 3 --psm 6") -> Tuple[str, List[Tuple[str, float]]]:
+    raw = pytesseract.image_to_string(pil_img, config=config)
+    data = pytesseract.image_to_data(pil_img, output_type=pytesseract.Output.DICT, config=config)
+    lines: List[Tuple[str, float]] = []
     if data and "line_num" in data:
-        current_line_num = -1
-        current_words = []
+        current_line = []
         confs = []
+        current_ln = -1
         for i in range(len(data["level"])):
-            ln = data.get("line_num", [None])[i]
-            txt = data.get("text", [""])[i]
-            conf = data.get("conf", ["-1"])[i]
-            if ln is None:
-                continue
-            # if new line starts, flush previous
-            if ln != current_line_num and current_line_num != -1:
-                joined = " ".join([w for w in current_words if w.strip()])
-                avg_conf = np.mean([float(c) for c in confs]) if confs else -1.0
-                lines.append((joined, float(avg_conf)))
-                current_words = []
+            ln = data["line_num"][i]
+            txt = data["text"][i]
+            conf = data["conf"][i]
+            if ln != current_ln and current_ln != -1:
+                joined = " ".join([w for w in current_line if w.strip()])
+                try:
+                    avg_conf = float(np.mean([float(c) for c in confs])) if confs else -1.0
+                except Exception:
+                    avg_conf = -1.0
+                lines.append((joined, avg_conf))
+                current_line = []
                 confs = []
-            current_line_num = ln
-            if txt.strip():
-                current_words.append(txt)
+            current_ln = ln
+            if txt and txt.strip():
+                current_line.append(txt)
                 try:
                     confs.append(float(conf))
                 except Exception:
                     confs.append(-1.0)
-        # flush last
-        if current_words:
-            joined = " ".join([w for w in current_words if w.strip()])
-            avg_conf = np.mean([float(c) for c in confs]) if confs else -1.0
-            lines.append((joined, float(avg_conf)))
-
-    # if we failed to parse lines, fallback to whole text
+        if current_line:
+            joined = " ".join([w for w in current_line if w.strip()])
+            try:
+                avg_conf = float(np.mean([float(c) for c in confs])) if confs else -1.0
+            except Exception:
+                avg_conf = -1.0
+            lines.append((joined, avg_conf))
     if not lines:
-        flat_text = text.strip()
-        if flat_text:
-            lines = [(flat_text, -1.0)]
-    return text.strip(), lines
+        if raw and raw.strip():
+            lines = [(raw.strip(), -1.0)]
+    return raw.strip(), lines
 
 
-def run_easyocr(cv_image):
-    """
-    Run EasyOCR on the preprocessed binary image.
-    Returns paragraph text (joined) and the list of detected strings.
-    """
+def _run_easyocr_on_img_detailed(img_np: np.ndarray) -> Tuple[str, List[Tuple[str, float]]]:
     try:
-        # easyocr expects either path or numpy array; passing binary image (uint8)
-        results = easyocr_reader.readtext(cv_image, detail=0, paragraph=True)
-        # results is list of strings (paragraph True merges into paragraphs)
-        joined = "\n".join(results).strip()
-        return joined, results
+        raw_res = easyocr_reader.readtext(img_np, detail=1, paragraph=False)
     except Exception:
-        logger.exception("EasyOCR failed")
+        logger.exception("EasyOCR error")
         return "", []
+    lines: List[Tuple[str, float]] = []
+    for item in raw_res:
+        if len(item) >= 3:
+            txt = (item[1] or "").strip()
+            conf = float(item[2]) if item[2] is not None else -1.0
+            lines.append((txt, conf))
+    joined = "\n".join([t for t, _ in lines])
+    return joined, lines
 
 
-# -------------------- Cleaning & merging --------------------
-def clean_ocr_text(text: str) -> str:
-    """
-    Basic post-processing to remove garbage, fix ligatures, collapse whitespace, etc.
-    """
+# -------------------- Merge & finalize --------------------
+def _merge_results(tess_lines: List[Tuple[str, float]], easy_lines: List[Tuple[str, float]],
+                   raw_tess: str, raw_easy: str) -> str:
+    final_lines: List[str] = []
+    seen_norm = set()
+
+    def norm(s):
+        return re.sub(r"[^\w]", "", s.lower())
+
+    # Accept easyocr lines first (filtered)
+    for e_text, e_conf in easy_lines or []:
+        line = _clean_line(e_text)
+        if not line:
+            continue
+        if _is_likely_gibberish(line):
+            continue
+        n = norm(line)
+        if n in seen_norm:
+            continue
+        final_lines.append(line)
+        seen_norm.add(n)
+
+    # Accept tesseract only if high confidence or clearly typed-like
+    for t_text, t_conf in tess_lines or []:
+        line = _clean_line(t_text)
+        if not line:
+            continue
+        if t_conf != -1 and t_conf < TESS_CONF_THRESHOLD:
+            if _is_likely_gibberish(line):
+                continue
+        else:
+            if _is_likely_gibberish(line):
+                continue
+        n = norm(line)
+        if n in seen_norm:
+            continue
+        final_lines.append(line)
+        seen_norm.add(n)
+
+    # fallback to raw texts if nothing
+    if not final_lines:
+        fallback = ((raw_easy or "") + "\n" + (raw_tess or "")).strip()
+        for ln in [l.strip() for l in fallback.splitlines() if l.strip()]:
+            if not _is_likely_gibberish(ln):
+                final_lines.append(_clean_line(ln))
+
+    return "\n".join(final_lines)
+
+
+def _final_cleanup(text: str) -> str:
     if not text:
         return ""
-
-    # unify line endings
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # common OCR ligature/garbage fixes
-    replacements = {
-        "\ufb01": "fi",
-        "\ufb02": "fl",
-        "ﬁ": "fi",
-        "ﬂ": "fl",
-        "\u200b": "",  # zero-width space
-        "\x0c": "",    # form feed from tesseract sometimes
-    }
-    for k, v in replacements.items():
-        text = text.replace(k, v)
-
-    # Remove very weird characters, keep printable unicode and basic punctuation.
-    # Allow letters, numbers, common punctuation and newlines.
-    text = re.sub(r"[^\w\s\.\,\:\;\?\!\-\(\)\/\'\"\%\—\–\u00C0-\u017F]", " ", text)
-
-    # Collapse multiple spaces
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    # Collapse multiple newlines to single
+    text = text.replace("\x0c", " ").replace("\u200b", "")
     text = re.sub(r"\n{3,}", "\n\n", text)
-    # Trim trailing whitespace on each line
-    lines = [ln.strip() for ln in text.splitlines()]
-    # Remove empty lines at start/end
+    lines = [l.strip() for l in text.splitlines()]
     while lines and lines[0] == "":
         lines.pop(0)
     while lines and lines[-1] == "":
         lines.pop()
-    cleaned = "\n".join(lines)
-    # final whitespace collapse
-    cleaned = re.sub(r" {2,}", " ", cleaned)
-    return cleaned.strip()
-
-
-def merge_texts(tess_lines, easy_lines, raw_tess_text, raw_easy_text):
-    """
-    Merge Tesseract and EasyOCR outputs intelligently.
-    - tess_lines: list of (line_text, avg_conf) tuples from tesseract
-    - easy_lines: list of strings from easyocr
-    - raw_tess_text, raw_easy_text: full raw text fallbacks
-    Strategy:
-      - Prefer high-confidence tesseract lines (conf >= 50)
-      - Use easyocr lines where tesseract confidence is low or absent
-      - Avoid duplicate lines using normalization
-    """
-    output_lines = []
-    seen_norm = set()
-
-    def normalize(s):
-        s2 = s.lower()
-        s2 = re.sub(r"[^\w]", "", s2)
-        return s2
-
-    # Add tesseract high-confidence first
-    if tess_lines:
-        for line, conf in tess_lines:
-            if not line or line.strip() == "":
-                continue
-            n = normalize(line)
-            if n in seen_norm:
-                continue
-            if conf >= 50 or conf == -1:  # -1 means unknown; allow it but may be low quality
-                output_lines.append(line.strip())
-                seen_norm.add(n)
-
-    # Now add easyocr lines if they are new
-    if easy_lines:
-        for e in easy_lines:
-            if not e or e.strip() == "":
-                continue
-            n = normalize(e)
-            if n in seen_norm:
-                continue
-            output_lines.append(e.strip())
-            seen_norm.add(n)
-
-    # If nothing collected, fallback to the best raw text we have
-    if not output_lines:
-        fallback = raw_tess_text or raw_easy_text or ""
-        if fallback:
-            # Split fallback sensibly into lines
-            flines = [ln.strip() for ln in fallback.splitlines() if ln.strip()]
-            for ln in flines:
-                n = normalize(ln)
-                if n not in seen_norm:
-                    output_lines.append(ln)
-                    seen_norm.add(n)
-
-    final = "\n".join(output_lines).strip()
-    return final
+    lines = [re.sub(r"[ \t]{2,}", " ", l) for l in lines]
+    return "\n".join(lines)
 
 
 # -------------------- Public API --------------------
+def extract_lines_with_conf(image_path: str) -> List[Dict]:
+    """
+    Returns list of dicts: {"text":..., "source":"tesseract"|"easyocr", "conf":float}
+    """
+    img_bgr = _load_image_bgr(image_path)
+
+    pil_for_tess = _preprocess_for_tesseract(img_bgr)
+    raw_tess, tess_lines = _run_tesseract_on_pil(pil_for_tess)
+
+    easy_img = _preprocess_for_handwriting(img_bgr)
+    raw_easy, easy_lines = _run_easyocr_on_img_detailed(easy_img)
+
+    items = []
+    for t_line, t_conf in tess_lines or []:
+        line = _clean_line(t_line)
+        if not line:
+            continue
+        items.append({"text": line, "source": "tesseract", "conf": float(t_conf)})
+
+    for e_line, e_conf in easy_lines or []:
+        line = _clean_line(e_line)
+        if not line:
+            continue
+        items.append({"text": line, "source": "easyocr", "conf": float(e_conf)})
+
+    return items
+
+
 def extract_text_from_image(image_path: str) -> str:
-    """
-    Full pipeline to extract (typed + handwritten) text from image_path.
-    Returns cleaned text ready to put in a DOCX.
-    """
-    # 1) Preprocess to get two variants
-    pil_for_tesseract, easyocr_img = preprocess_image(image_path)
+    img_bgr = _load_image_bgr(image_path)
 
-    # 2) Tesseract extraction
-    raw_tess_text, tess_lines = run_tesseract(pil_for_tesseract, config="--oem 3 --psm 6")
-    logger.info(f"Tesseract raw length: {len(raw_tess_text)}; lines: {len(tess_lines) if tess_lines else 0}")
+    pil_for_tess = _preprocess_for_tesseract(img_bgr)
+    raw_tess, tess_lines = _run_tesseract_on_pil(pil_for_tess)
 
-    # 3) EasyOCR extraction (handwriting)
-    raw_easy_text, easy_lines = run_easyocr(easyocr_img)
-    logger.info(f"EasyOCR detected {len(easy_lines)} items; raw len: {len(raw_easy_text)}")
+    easy_img = _preprocess_for_handwriting(img_bgr)
+    raw_easy, easy_lines = _run_easyocr_on_img_detailed(easy_img)
 
-    # 4) Merge intelligently
-    merged = merge_texts(tess_lines or [], easy_lines or [], raw_tess_text, raw_easy_text)
-
-    # 5) Clean and return
-    cleaned = clean_ocr_text(merged)
+    merged = _merge_results(tess_lines or [], easy_lines or [], raw_tess, raw_easy)
+    cleaned = _final_cleanup(merged)
     logger.info(f"Final cleaned text length: {len(cleaned)}")
     return cleaned
 

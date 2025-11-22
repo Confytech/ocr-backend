@@ -1,54 +1,116 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>OCR Upload</title>
+  <meta charset="utf-8"/>
+  <title>OCR Upload & Edit</title>
+  <style>
+    body { font-family: system-ui, Arial; max-width:900px; margin:20px auto; }
+    .line { display:flex; gap:8px; align-items:center; margin:6px 0; }
+    .src { width:90px; font-size:12px; color:#666; }
+    .conf { width:60px; font-size:12px; color:#666; }
+    .txt { flex:1; }
+    textarea#fulltext { width:100%; min-height:240px; }
+    button { padding:8px 12px; margin-top:12px; }
+  </style>
 </head>
 <body>
-    <h1>Upload Image for OCR</h1>
-    <form id="uploadForm" enctype="multipart/form-data">
-        <input type="file" name="image" accept="image/*" required>
-        <button type="submit">Upload</button>
-    </form>
+  <h2>Upload image — edit extracted text</h2>
+  <form id="uploadForm" enctype="multipart/form-data">
+    <input type="file" name="image" accept="image/*" required />
+    <button type="submit">Extract</button>
+  </form>
 
-    <p id="status"></p>
+  <div id="status"></div>
+  <div id="linesContainer" style="margin-top:12px;"></div>
 
-    <script>
-        const form = document.getElementById('uploadForm');
-        const status = document.getElementById('status');
+  <button id="mergeBtn" style="display:none">Merge to editor</button>
+  <div style="margin-top:12px;">
+    <h3>Final text (edit if needed)</h3>
+    <textarea id="fulltext" placeholder="Final text will appear here..."></textarea><br/>
+    <button id="downloadBtn" style="display:none">Generate & Download DOCX</button>
+  </div>
 
-        form.addEventListener('submit', async (e) => {
-            e.preventDefault();
+<script>
+const form = document.getElementById('uploadForm');
+const status = document.getElementById('status');
+const linesContainer = document.getElementById('linesContainer');
+const mergeBtn = document.getElementById('mergeBtn');
+const fulltext = document.getElementById('fulltext');
+const downloadBtn = document.getElementById('downloadBtn');
 
-            const formData = new FormData(form);
-            status.textContent = "Uploading...";
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  status.textContent = "Uploading and extracting...";
+  linesContainer.innerHTML = "";
+  mergeBtn.style.display = 'none';
+  downloadBtn.style.display = 'none';
+  fulltext.value = "";
 
-            try {
-                const response = await fetch('/api/upload', {
-                    method: 'POST',
-                    body: formData
-                });
+  const fd = new FormData(form);
+  const resp = await fetch('/api/extract', { method: 'POST', body: fd });
+  if (!resp.ok) {
+    const err = await resp.json().catch(()=>({error:resp.statusText}));
+    status.textContent = "Error: " + (err.error || resp.statusText);
+    return;
+  }
+  const data = await resp.json();
+  const lines = data.lines || [];
+  if (lines.length === 0) {
+    status.textContent = "No text found.";
+    return;
+  }
+  status.textContent = `Found ${lines.length} lines. Edit as needed.`;
+  lines.forEach((ln, idx) => {
+    const div = document.createElement('div');
+    div.className = 'line';
+    const safeText = (ln.text||'').replace(/"/g,'&quot;');
+    div.innerHTML = `
+      <div class="src">${ln.source}</div>
+      <div class="conf">${Math.round((ln.conf||0)*100)/100}</div>
+      <input class="txt" data-idx="${idx}" value="${safeText}" />
+    `;
+    linesContainer.appendChild(div);
+  });
+  mergeBtn.style.display = 'inline-block';
+  downloadBtn.style.display = 'inline-block';
+});
 
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    status.textContent = "Error: " + (errorData.error || response.statusText);
-                    return;
-                }
+mergeBtn.addEventListener('click', () => {
+  const inputs = Array.from(document.querySelectorAll('.txt'));
+  const merged = inputs.map(i => i.value.trim()).filter(Boolean).join("\n");
+  fulltext.value = merged;
+  status.textContent = "Merged to editor. Make final edits, then Generate DOCX.";
+  downloadBtn.style.display = 'inline-block';
+});
 
-                const blob = await response.blob();
-                const filename = formData.get("image").name.replace(/\.[^/.]+$/, ".docx");
-
-                const link = document.createElement('a');
-                link.href = window.URL.createObjectURL(blob);
-                link.download = filename;
-                link.click();
-
-                status.textContent = "Download started!";
-            } catch (err) {
-                status.textContent = "Error uploading image: " + err;
-            }
-        });
-    </script>
+downloadBtn.addEventListener('click', async () => {
+  const text = fulltext.value;
+  if (!text.trim()) {
+    alert("Final text is empty.");
+    return;
+  }
+  status.textContent = "Generating DOCX...";
+  const resp = await fetch('/api/generate_docx', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ filename: 'extracted', text })
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(()=>({error:resp.statusText}));
+    status.textContent = "Error: " + (err.error||resp.statusText);
+    return;
+  }
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'extracted.docx';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  status.textContent = "Download started.";
+});
+</script>
 </body>
 </html>
 
