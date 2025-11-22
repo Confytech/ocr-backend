@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>OCR Upload</title>
+</head>
+<body>
+    <h1>Upload Image for OCR</h1>
+    <form id="uploadForm" enctype="multipart/form-data">
+        <input type="file" name="image" accept="image/*" required>
+        <button type="submit">Upload</button>
+    </form>
+
+    <p id="status"></p>
+
+    <script>
+        const form = document.getElementById('uploadForm');
+        const status = document.getElementById('status');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const formData = new FormData(form);
+            status.textContent = "Uploading...";
+
+            try {
+                const response = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    status.textContent = "Error: " + (errorData.error || response.statusText);
+                    return;
+                }
+
+                const blob = await response.blob();
+                const filename = formData.get("image").name.replace(/\.[^/.]+$/, ".docx");
+
+                const link = document.createElement('a');
+                link.href = window.URL.createObjectURL(blob);
+                link.download = filename;
+                link.click();
+
+                status.textContent = "Download started!";
+            } catch (err) {
+                status.textContent = "Error uploading image: " + err;
+            }
+        });
+    </script>
+</body>
+</html>
+
