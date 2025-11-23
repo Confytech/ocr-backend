@@ -13,17 +13,23 @@
     button { padding:8px 12px; margin-top:12px; }
   </style>
 </head>
+
 <body>
-  <h2>Upload image — edit extracted text</h2>
+  <h2>OCR Upload & Edit</h2>
+
+  <!-- MULTI-FILE UPLOAD SECTION -->
+  <h3>Select Images (Multiple Allowed)</h3>
   <form id="uploadForm" enctype="multipart/form-data">
-    <input type="file" name="image" accept="image/*" required />
-    <button type="submit">Extract</button>
+    <input type="file" name="image" accept="image/*" multiple required />
+    <button type="submit">Extract (Structured Editor)</button>
+    <button id="combineBtn" type="button">Upload All → Combined DOCX</button>
   </form>
 
   <div id="status"></div>
   <div id="linesContainer" style="margin-top:12px;"></div>
 
   <button id="mergeBtn" style="display:none">Merge to editor</button>
+
   <div style="margin-top:12px;">
     <h3>Final text (edit if needed)</h3>
     <textarea id="fulltext" placeholder="Final text will appear here..."></textarea><br/>
@@ -37,7 +43,11 @@ const linesContainer = document.getElementById('linesContainer');
 const mergeBtn = document.getElementById('mergeBtn');
 const fulltext = document.getElementById('fulltext');
 const downloadBtn = document.getElementById('downloadBtn');
+const combineBtn = document.getElementById('combineBtn');
 
+//
+// 1) Existing "Extract to Editor" flow (single image)
+//
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   status.textContent = "Uploading and extracting...";
@@ -46,19 +56,30 @@ form.addEventListener('submit', async (e) => {
   downloadBtn.style.display = 'none';
   fulltext.value = "";
 
-  const fd = new FormData(form);
+  const fd = new FormData();
+  const file = form.image.files[0];
+
+  if (!file) {
+    status.textContent = "Please select a file.";
+    return;
+  }
+
+  fd.append("image", file);
+
   const resp = await fetch('/api/extract', { method: 'POST', body: fd });
   if (!resp.ok) {
     const err = await resp.json().catch(()=>({error:resp.statusText}));
     status.textContent = "Error: " + (err.error || resp.statusText);
     return;
   }
+
   const data = await resp.json();
   const lines = data.lines || [];
   if (lines.length === 0) {
     status.textContent = "No text found.";
     return;
   }
+
   status.textContent = `Found ${lines.length} lines. Edit as needed.`;
   lines.forEach((ln, idx) => {
     const div = document.createElement('div');
@@ -71,10 +92,53 @@ form.addEventListener('submit', async (e) => {
     `;
     linesContainer.appendChild(div);
   });
+
   mergeBtn.style.display = 'inline-block';
   downloadBtn.style.display = 'inline-block';
 });
 
+//
+// 2) MULTI-FILE → COMBINED DOCX
+//
+combineBtn.addEventListener('click', async () => {
+  const files = form.image.files;
+  if (!files.length) {
+    alert("Select at least one image.");
+    return;
+  }
+
+  status.textContent = "Uploading and processing multiple images...";
+
+  const fd = new FormData();
+  for (let f of files) fd.append("image", f);
+
+  const resp = await fetch('/api/upload', {
+    method: 'POST',
+    body: fd
+  });
+
+  if (!resp.ok) {
+    const err = await resp.json().catch(()=>({error: resp.statusText}));
+    status.textContent = "Error: " + (err.error || resp.statusText);
+    return;
+  }
+
+  const blob = await resp.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+
+  a.href = url;
+  a.download = "combined_output.docx";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  status.textContent = "Combined DOCX downloaded.";
+});
+
+//
+// 3) Merge edited lines → textarea
+//
 mergeBtn.addEventListener('click', () => {
   const inputs = Array.from(document.querySelectorAll('.txt'));
   const merged = inputs.map(i => i.value.trim()).filter(Boolean).join("\n");
@@ -83,23 +147,30 @@ mergeBtn.addEventListener('click', () => {
   downloadBtn.style.display = 'inline-block';
 });
 
+//
+// 4) Generate DOCX from editor text
+//
 downloadBtn.addEventListener('click', async () => {
   const text = fulltext.value;
   if (!text.trim()) {
     alert("Final text is empty.");
     return;
   }
+
   status.textContent = "Generating DOCX...";
+
   const resp = await fetch('/api/generate_docx', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({ filename: 'extracted', text })
   });
+
   if (!resp.ok) {
     const err = await resp.json().catch(()=>({error:resp.statusText}));
     status.textContent = "Error: " + (err.error||resp.statusText);
     return;
   }
+
   const blob = await resp.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -108,9 +179,10 @@ downloadBtn.addEventListener('click', async () => {
   document.body.appendChild(a);
   a.click();
   a.remove();
+
   status.textContent = "Download started.";
 });
 </script>
+
 </body>
 </html>
-
